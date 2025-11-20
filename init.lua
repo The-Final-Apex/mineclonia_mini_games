@@ -39,6 +39,9 @@ local battle_pos_marks = {}        -- [player_name] = { pos1, pos2 }
 -- Stores original groups for nodes we override for Tumble
 local tumble_original_groups = {}
 
+-- Player statistics
+local player_stats = {}            -- [player_name] = { wins=0, losses=0, kills=0, deaths=0, games_played=0 }
+
 ------------------------------------------------------------
 -- CONFIG (PERSISTENT)
 ------------------------------------------------------------
@@ -74,10 +77,20 @@ local function load_config()
             config.player_spawns = config.player_spawns or {}
         end
     end
+    
+    -- Load player stats
+    local stats_raw = storage:get_string("player_stats")
+    if stats_raw ~= "" then
+        local ok, data = pcall(minetest.deserialize, stats_raw)
+        if ok and type(data) == "table" then
+            player_stats = data
+        end
+    end
 end
 
 local function save_config()
     storage:set_string("config", minetest.serialize(config))
+    storage:set_string("player_stats", minetest.serialize(player_stats))
 end
 
 load_config()
@@ -169,6 +182,59 @@ end
 local function teleport_player(name, pos)
     local p = minetest.get_player_by_name(name)
     if p and pos then p:set_pos(pos) end
+end
+
+------------------------------------------------------------
+-- PLAYER STATISTICS SYSTEM
+------------------------------------------------------------
+
+local function init_player_stats(name)
+    if not player_stats[name] then
+        player_stats[name] = {
+            wins = 0,
+            losses = 0,
+            kills = 0,
+            deaths = 0,
+            games_played = 0,
+            battle_wins = 0,
+            tumble_wins = 0
+        }
+    end
+    return player_stats[name]
+end
+
+local function update_player_stat(name, stat, value)
+    local stats = init_player_stats(name)
+    stats[stat] = (stats[stat] or 0) + (value or 1)
+    save_config()
+end
+
+local function show_player_stats(name, target)
+    local player_name = target or name
+    local stats = player_stats[player_name]
+    
+    if not stats then
+        if name == player_name then
+            msg(name, "You have no stats yet. Play some games!")
+        else
+            msg(name, "Player '" .. player_name .. "' has no stats.")
+        end
+        return
+    end
+    
+    local win_rate = stats.games_played > 0 and 
+        math.floor((stats.wins / stats.games_played) * 100) or 0
+    local kd_ratio = stats.deaths > 0 and 
+        string.format("%.2f", stats.kills / stats.deaths) or stats.kills > 0 and "∞" or "0.00"
+    
+    local prefix = name == player_name and "Your" or player_name .. "'s"
+    
+    minetest.chat_send_player(name, minetest.colorize("#FFD700", "=== " .. prefix .. " Battle Stats ==="))
+    minetest.chat_send_player(name, "Wins: " .. stats.wins .. " | Losses: " .. stats.losses)
+    minetest.chat_send_player(name, "Win Rate: " .. win_rate .. "% | Games: " .. stats.games_played)
+    minetest.chat_send_player(name, "Kills: " .. stats.kills .. " | Deaths: " .. stats.deaths)
+    minetest.chat_send_player(name, "K/D Ratio: " .. kd_ratio)
+    minetest.chat_send_player(name, "Battle Wins: " .. (stats.battle_wins or 0) .. " | Tumble Wins: " .. (stats.tumble_wins or 0))
 end
 
 ------------------------------------------------------------
@@ -483,12 +549,6 @@ end
 -- TUMBLE: MULTI-LAYER SPLEEF FLOOR GENERATION
 ------------------------------------------------------------
 
--- arena.tumble_layers is a list like:
--- {
---   { y = 6, radius = 10, palette = {"mcl_core:snow_block","mcl_core:gravel"} },
---   { y = -10, radius = 12, palette = {...} },
--- }
-
 local function build_tumble_layers_for_arena(arena)
     if not arena or not arena.center then
         return
@@ -538,28 +598,77 @@ battle.votes = {}
 local MIN_PLAYERS    = 2
 local COUNTDOWN_TIME = 15
 
+------------------------------------------------------------
+-- ARENA VALIDATION
+------------------------------------------------------------
+
+local function validate_arena(aid, arena)
+    local errors = {}
+    
+    if not arena.center then
+        table.insert(errors, "No center set")
+    end
+    
+    if not arena.radius or arena.radius <= 0 then
+        table.insert(errors, "Invalid radius")
+    end
+    
+    local spawn_count = 0
+    for _ in pairs(arena.spawn_points or {}) do spawn_count = spawn_count + 1 end
+    if spawn_count < MIN_PLAYERS then
+        table.insert(errors, string.format("Only %d spawn points (need %d)", spawn_count, MIN_PLAYERS))
+    end
+    
+    if #errors > 0 then
+        minetest.log("warning", string.format("[battle_lobby] Arena '%s' issues: %s", 
+            aid, table.concat(errors, ", ")))
+        return false, errors
+    end
+    
+    return true
+end
+
 local function show_map_vote_formspec(name)
     local list = iter_enabled_arenas()
     if #list == 0 then
         msg(name,"No arenas available to vote for.")
         return
     end
+    
+    local current_vote = battle.votes[name]
     local fs = {
         "formspec_version[4]",
-        "size[8,7]",
+        "size[8,8]",
         "label[0.5,0.3;Battle Map Voting]",
         "label[0.5,0.8;Click the map you want to play:]",
     }
-    local y = 1.3
+    
+    if current_vote then
+        table.insert(fs, "label[0.5,1.0;Your vote: " .. minetest.formspec_escape(current_vote) .. "]")
+    end
+    
+    local y = 1.5
     for _,e in ipairs(list) do
         local id = e.id
         local a = e.arena
         local label = a.label or id
-        table.insert(fs, ("button[1,%f;6,0.7;bvote_%s;%s]"):format(
-            y, id, minetest.formspec_escape(label.." ("..id..")")))
+        
+        -- Count votes for this arena
+        local vote_count = 0
+        for _,v in pairs(battle.votes) do 
+            if v == id then vote_count = vote_count + 1 end 
+        end
+        
+        -- Validate arena and show status
+        local valid, errors = validate_arena(id, a)
+        local status = valid and "✓" or "✗"
+        
+        table.insert(fs, ("button[1,%f;6,0.7;bvote_%s;%s %s (%d votes)]"):format(
+            y, id, minetest.formspec_escape(label), status, vote_count))
         y = y + 0.85
-        if y > 6.3 then break end
     end
+    
+    table.insert(fs, "button[1,7.0;6,0.7;close;Close]")
     minetest.show_formspec(name,"battle_lobby:vote",table.concat(fs,""))
 end
 
@@ -568,7 +677,10 @@ local function pick_arena_from_votes()
     for _,aid in pairs(battle.votes) do
         local a = config.arenas[aid]
         if a and a.enabled ~= false then
-            counts[aid] = (counts[aid] or 0)+1
+            local valid = validate_arena(aid, a)
+            if valid then
+                counts[aid] = (counts[aid] or 0)+1
+            end
         end
     end
     local best_count = 0
@@ -737,6 +849,14 @@ local function start_match()
         return
     end
 
+    -- Validate arena before starting
+    local valid, errors = validate_arena(aid, arena)
+    if not valid then
+        broadcast("Arena '" .. aid .. "' has issues: " .. table.concat(errors, ", "))
+        reset_match_state()
+        return
+    end
+
     prepare_battle_chests(aid, arena)
 
     local max_players = math.min(arena.max_players or 8, 8)
@@ -782,6 +902,9 @@ local function start_match()
                 battle_slot_for_player[pname] = slot
                 battle_player_for_slot[slot] = pname
 
+                -- Update stats
+                update_player_stat(pname, "games_played")
+                
                 msg(pname,"You are in slot #"..slot.." on '"..label.."'. Fight!")
             end
         end
@@ -805,6 +928,15 @@ local function end_match(winner)
 
     if winner then
         broadcast("Battle over! Winner: "..winner)
+        update_player_stat(winner, "wins")
+        update_player_stat(winner, "battle_wins")
+        
+        -- Update losses for other players
+        for pname,_ in pairs(battle.players) do
+            if pname ~= winner then
+                update_player_stat(pname, "losses")
+            end
+        end
     else
         broadcast("Battle ended.")
     end
@@ -819,7 +951,6 @@ local function end_match(winner)
 
     reset_match_state()
 end
-
 
 -- Shallow copy helper
 local function copy_groups(tbl)
@@ -1055,38 +1186,45 @@ local function update_armor_hud(player)
 end
 
 ------------------------------------------------------------
--- GLOBALSTEP (battle + tumble countdown / border / chest / HUD)
+-- OPTIMIZED GLOBALSTEP
 ------------------------------------------------------------
 
 local timer_accum = 0
+local last_chest_update = 0
+local last_hud_update = 0
+local last_border_check = 0
 
 minetest.register_globalstep(function(dtime)
     timer_accum = timer_accum + dtime
-    if timer_accum < 1 then return end
-    timer_accum = 0
-
+    
+    -- Only run heavy operations every 0.5 seconds
+    if timer_accum < 0.5 then return end
+    
+    local now = os.time()
+    
     ----------------------------------------------------------------
-    -- BATTLE COUNTDOWN
+    -- BATTLE COUNTDOWN (every 0.5s)
     ----------------------------------------------------------------
     if battle.state == "countdown" then
-        battle.countdown = battle.countdown - 1
+        battle.countdown = battle.countdown - 0.5
         if battle.countdown <= 0 then
             start_match()
-        else
-            if battle.countdown == 10 or battle.countdown == 5 or battle.countdown <= 3 then
-                broadcast("Battle starting in " .. battle.countdown .. "s...")
+        elseif math.floor(battle.countdown) ~= math.floor(battle.countdown + 0.5) then
+            -- Only broadcast on whole seconds
+            local whole_sec = math.floor(battle.countdown)
+            if whole_sec == 10 or whole_sec == 5 or whole_sec <= 3 then
+                broadcast("Battle starting in " .. whole_sec .. "s...")
             end
         end
     end
-
+    
     ----------------------------------------------------------------
-    -- TUMBLE COUNTDOWN
+    -- TUMBLE COUNTDOWN (every 0.5s)
     ----------------------------------------------------------------
     if tumble.state == "countdown" then
-        tumble.countdown = tumble.countdown - 1
-
+        tumble.countdown = tumble.countdown - 0.5
+        
         if tumble.countdown <= 0 then
-            -- pick an arena
             local aid, arena = get_random_arena()
             if not aid or not arena then
                 broadcast("No arenas for Tumble.")
@@ -1096,7 +1234,7 @@ minetest.register_globalstep(function(dtime)
                 tumble.state = "running"
                 tumble.players = {}
                 tumble.alive = {}
-
+                
                 -- make all Tumble layer palette nodes instabreak
                 if arena.tumble_layers then
                     local seen = {}
@@ -1111,10 +1249,10 @@ minetest.register_globalstep(function(dtime)
                         end
                     end
                 end
-
+                
                 broadcast("Starting Tumble on " .. (arena.label or aid) ..
                     " with " .. #tumble.queue .. " players.")
-
+                
                 local max_slots = arena.max_players or 8
                 for i, pname in ipairs(tumble.queue) do
                     if i > max_slots then
@@ -1127,26 +1265,28 @@ minetest.register_globalstep(function(dtime)
                             teleport_player(pname, pos)
                             tumble.players[pname] = true
                             tumble.alive[pname] = true
+                            update_player_stat(pname, "games_played")
                         else
                             msg(pname, "No Tumble spawn slot " .. slot ..
                                 " set for arena " .. aid)
                         end
                     end
                 end
-
+                
                 tumble.queue = {}
             end
-        else
-            if tumble.countdown == 5 or tumble.countdown <= 3 then
-                broadcast("Tumble starting in " .. tumble.countdown .. "s...")
+        elseif math.floor(tumble.countdown) ~= math.floor(tumble.countdown + 0.5) then
+            local whole_sec = math.floor(tumble.countdown)
+            if whole_sec == 5 or whole_sec <= 3 then
+                broadcast("Tumble starting in " .. whole_sec .. "s...")
             end
         end
     end
-
+    
     ----------------------------------------------------------------
-    -- BATTLE BORDER CHECK
+    -- BATTLE BORDER CHECK (every 2 seconds)
     ----------------------------------------------------------------
-    if battle.state == "running" and battle.arena_id then
+    if battle.state == "running" and battle.arena_id and now - last_border_check >= 2 then
         local arena = config.arenas[battle.arena_id]
         if arena and arena.center and arena.radius then
             for name,_ in pairs(battle.alive) do
@@ -1162,108 +1302,98 @@ minetest.register_globalstep(function(dtime)
                 end
             end
         end
+        last_border_check = now
     end
-
+    
     ----------------------------------------------------------------
-    -- OTHER PERIODIC UPDATES
+    -- CHEST UPDATES (every 2 seconds)
     ----------------------------------------------------------------
-    update_battle_chest_refills()
-    revive_update_all()
-
-    for _,player in ipairs(minetest.get_connected_players()) do
-        update_armor_hud(player)
+    if now - last_chest_update >= 2 then
+        update_battle_chest_refills()
+        last_chest_update = now
     end
+    
+    ----------------------------------------------------------------
+    -- HUD UPDATES (every 1 second)
+    ----------------------------------------------------------------
+    if now - last_hud_update >= 1 then
+        revive_update_all()
+        
+        -- Update armor HUD for all players
+        for _,player in ipairs(minetest.get_connected_players()) do
+            update_armor_hud(player)
+        end
+        
+        last_hud_update = now
+    end
+    
+    timer_accum = 0
 end)
 
--- Patch all snowball-like entities so they can break blocks in Tumble
-local function patch_snowballs_for_tumble()
-    local patched = {}
+------------------------------------------------------------
+-- SNOWBALL ENTITY PATCH FOR TUMBLE
+------------------------------------------------------------
 
-    -- Helper: shallow copy groups (used elsewhere already)
-    local function break_block_at(pos)
-        if not pos then return end
-        pos = vector.round(pos)
-        local node = minetest.get_node(pos)
-        if not node or node.name == "air" or node.name == "ignore" then
-            return
-        end
-        if node.name ~= "mcl_core:bedrock" then
-            minetest.dig_node(pos)
-            minetest.log("action", "[battle_lobby] Snowball broke block at " ..
-                minetest.pos_to_string(pos) .. " (" .. node.name .. ")")
-        end
+local function patch_snowball_for_tumble()
+    local snowball_def = minetest.registered_entities["mcl_throwing:snowball_entity"]
+    if not snowball_def then
+        minetest.log("error", "[battle_lobby] Snowball entity not found; Tumble snowball patch skipped.")
+        return
     end
 
-    -- DEBUG: set true to test *without* Tumble running
-    local DEBUG_ALWAYS_BREAK = true
+    -- Avoid double patching
+    if snowball_def._battle_lobby_snowball_patched then
+        return
+    end
+    snowball_def._battle_lobby_snowball_patched = true
 
-    for name, def in pairs(minetest.registered_entities) do
-        -- Catch anything that looks like a snowball entity
-        if name:find("snowball") then
-            local old_step = def.on_step
+    local old_on_step = snowball_def.on_step
 
-            minetest.registered_entities[name].on_step = function(self, dtime, moveresult)
-                -- Call original behavior (movement, lifetime, etc.)
-                if old_step then
-                    local ok, err = pcall(old_step, self, dtime, moveresult)
-                    if not ok then
-                        minetest.log("error",
-                            "[battle_lobby] Error in original snowball on_step (" ..
-                            name .. "): " .. tostring(err))
-                    end
-                end
+    snowball_def.on_step = function(self, dtime, moveresult)
+        -- Call original behavior first with error handling
+        if old_on_step then
+            local ok, err = pcall(old_on_step, self, dtime, moveresult)
+            if not ok then
+                minetest.log("error", "[battle_lobby] Snowball original on_step error: " .. tostring(err))
+            end
+        end
 
-                -- Who threw it?
-                local thrower_name = self._thrower or self._owner or self._shooter
+        -- Safety check
+        if not self.object then return end
+        
+        -- Only break blocks during Tumble matches
+        if tumble.state ~= "running" then return end
 
-                -- Only break in Tumble, unless debug mode is on
-                if not DEBUG_ALWAYS_BREAK then
-                    if tumble.state ~= "running" then
-                        return
-                    end
-                    if not thrower_name or not tumble.players[thrower_name] then
-                        return
-                    end
-                end
-
-                -- Use moveresult collisions if available
-                if moveresult and moveresult.collisions then
-                    for _, col in ipairs(moveresult.collisions) do
-                        if col.type == "node" and col.node_pos then
-                            break_block_at(col.node_pos)
-                            self.object:remove()
-                            return
-                        end
-                    end
-                else
-                    -- Fallback: check current position
-                    local pos = self.object:get_pos()
-                    if pos then
-                        break_block_at(pos)
-                        -- If we broke something (now air), remove the snowball
-                        local node = minetest.get_node(vector.round(pos))
-                        if node.name == "air" then
-                            self.object:remove()
+        -- Use moveresult collisions
+        if moveresult and moveresult.collisions then
+            for _, collision in ipairs(moveresult.collisions) do
+                if collision.type == "node" and collision.node_pos then
+                    local hit_pos = collision.node_pos
+                    local node = minetest.get_node(hit_pos)
+                    
+                    -- Check if node is in Tumble layers
+                    local arena = tumble.arena_id and config.arenas[tumble.arena_id]
+                    if arena and arena.tumble_layers then
+                        for _, layer in ipairs(arena.tumble_layers) do
+                            if layer.palette and table_contains(layer.palette, node.name) then
+                                minetest.remove_node(hit_pos)
+                                if self.object then
+                                    self.object:remove()
+                                end
+                                return
+                            end
                         end
                     end
                 end
             end
-
-            table.insert(patched, name)
         end
     end
 
-    if #patched == 0 then
-        minetest.log("warning", "[battle_lobby] No snowball-like entities found to patch.")
-    else
-        minetest.log("action", "[battle_lobby] Patched snowball-like entities: " ..
-            table.concat(patched, ", "))
-    end
+    minetest.log("action", "[battle_lobby] Snowball entity patched for Tumble.")
 end
 
-
 ------------------------------------------------------------
--- PLAYER EVENTS
+-- PLAYER EVENTS WITH MEMORY LEAK PREVENTION
 ------------------------------------------------------------
 
 minetest.register_on_joinplayer(function(player)
@@ -1295,7 +1425,21 @@ end)
 local function end_tumble_match(winner)
     local finished_arena = tumble.arena_id
 
-    broadcast("Tumble over! Winner: "..(winner or "none"))
+    if winner then
+        broadcast("Tumble over! Winner: "..winner)
+        update_player_stat(winner, "wins")
+        update_player_stat(winner, "tumble_wins")
+        
+        -- Update losses for other players
+        for pname,_ in pairs(tumble.players) do
+            if pname ~= winner then
+                update_player_stat(pname, "losses")
+            end
+        end
+    else
+        broadcast("Tumble ended.")
+    end
+
     for pname,_ in pairs(tumble.players) do
         teleport_player(pname, get_default_spawn_for(pname))
     end
@@ -1304,6 +1448,8 @@ local function end_tumble_match(winner)
         battle_reset_arena_map(finished_arena)
     end
 
+    tumble_restore_instabreak_nodes()
+    
     tumble.state   = "idle"
     tumble.players = {}
     tumble.alive   = {}
@@ -1312,9 +1458,17 @@ end
 
 minetest.register_on_leaveplayer(function(player)
     local name = player:get_player_name()
+    
+    -- Clean up barrier markers to prevent memory leaks
+    if barrier_debug[name] then
+        clear_markers_for(name)
+        barrier_debug[name] = nil
+    end
+    
     clear_legacy_atmosphere(player)
     clear_armor_hud(player)
 
+    -- Clean up revive HUD
     if battle_revive_hud[name] then
         local ui = battle_revive_hud[name]
         for _,id in pairs(ui.bg or {}) do player:hud_remove(id) end
@@ -1346,9 +1500,19 @@ end)
 
 minetest.register_on_dieplayer(function(player)
     local name = player:get_player_name()
+    
+    -- Update death statistics
+    update_player_stat(name, "deaths")
 
     if battle.state=="running" and battle.alive[name] then
         battle.alive[name] = nil
+        
+        -- Update kill stats for the player who caused the death
+        local last_puncher = player:get_meta():get_string("last_puncher")
+        if last_puncher and last_puncher ~= "" and last_puncher ~= name then
+            update_player_stat(last_puncher, "kills")
+        end
+        
         local arena = battle.arena_id and config.arenas[battle.arena_id]
         if arena and arena.spectator_spawn then
             minetest.after(0.1,function()
@@ -1374,6 +1538,16 @@ minetest.register_on_dieplayer(function(player)
             local winner
             for n,_ in pairs(tumble.alive) do winner=n end
             end_tumble_match(winner)
+        end
+    end
+end)
+
+minetest.register_on_punchplayer(function(player, hitter, time_from_last_punch, tool_capabilities, dir, damage)
+    if hitter and hitter:is_player() then
+        local hitter_name = hitter:get_player_name()
+        local player_name = player:get_player_name()
+        if hitter_name and player_name then
+            player:get_meta():set_string("last_puncher", hitter_name)
         end
     end
 end)
@@ -1405,6 +1579,11 @@ minetest.register_on_player_receive_fields(function(player, formname, fields)
     if formname ~= "battle_lobby:vote" then return end
     local name = player:get_player_name()
     if not name then return end
+    
+    if fields.close then
+        return
+    end
+    
     for field,_ in pairs(fields) do
         if field:sub(1,6) == "bvote_" then
             local aid = field:sub(7)
@@ -1422,8 +1601,69 @@ minetest.register_on_player_receive_fields(function(player, formname, fields)
 end)
 
 ------------------------------------------------------------
--- CHAT COMMANDS: BATTLE JOIN / CONFIG / VOTE
+-- NODE ALIAS COMPATIBILITY
 ------------------------------------------------------------
+
+local node_aliases = {
+    -- Minetest Game to Mineclonia
+    ["default:pine_wood"] = "mcl_trees:wood_spruce",
+    ["stairs:stair_pine_wood"] = "mcl_stairs:stair_spruce", 
+    ["stairs:slab_pine_wood"] = "mcl_stairs:slab_spruce",
+    ["default:lava_source"] = "mcl_core:lava_source",
+    ["default:lava_flowing"] = "mcl_core:lava_flowing",
+    ["default:fence_wood"] = "mcl_fences:oak_fence",
+    ["default:fence_pine_wood"] = "mcl_fences:spruce_fence",
+    ["default:fence_rail_pine_wood"] = "mcl_fences:spruce_fence_gate",
+    
+    -- Nether mod compatibility
+    ["nether:brick"] = "mcl_nether:nether_brick",
+    ["nether:rack"] = "mcl_nether:netherrack",
+    
+    -- xdecor compatibility  
+    ["xdecor:stone_rune"] = "mcl_core:stonebrickcarved",
+    ["xdecor:stone_tile"] = "mcl_core:stone_smooth",
+    
+    -- Walls mod
+    ["walls:cobble"] = "mcl_walls:cobble",
+    
+    -- More common aliases
+    ["default:stone"] = "mcl_core:stone",
+    ["default:dirt"] = "mcl_core:dirt",
+    ["default:wood"] = "mcl_trees:wood_oak",
+    ["default:tree"] = "mcl_trees:tree_oak",
+    ["default:leaves"] = "mcl_core:leaves_oak",
+    ["default:glass"] = "mcl_core:glass",
+    ["default:sand"] = "mcl_core:sand",
+    ["default:gravel"] = "mcl_core:gravel",
+    ["default:cobble"] = "mcl_core:cobble",
+    ["default:mossycobble"] = "mcl_core:mossycobble",
+    ["default:coalblock"] = "mcl_core:coalblock",
+    ["default:steelblock"] = "mcl_core:ironblock",
+    ["default:goldblock"] = "mcl_core:goldblock",
+    ["default:diamondblock"] = "mcl_core:diamondblock",
+}
+
+local function register_node_aliases()
+    for alias, target in pairs(node_aliases) do
+        if minetest.registered_nodes[target] and not minetest.registered_nodes[alias] then
+            minetest.register_alias(alias, target)
+        end
+    end
+    minetest.log("action", "[battle_lobby] Registered " .. count_set(node_aliases) .. " node aliases")
+end
+
+------------------------------------------------------------
+-- CHAT COMMANDS
+------------------------------------------------------------
+
+minetest.register_chatcommand("stats", {
+    description = "Show your Battle statistics",
+    params = "[player_name]",
+    func = function(name, param)
+        local target = param ~= "" and param or name
+        show_player_stats(name, target)
+    end
+})
 
 minetest.register_chatcommand("battle_join",{
     description="Join next Battle match.",
@@ -1467,328 +1707,45 @@ minetest.register_chatcommand("battle_vote",{
     end
 })
 
-minetest.register_chatcommand("battle_forcestart",{
-    privs={server=true},
-    description="Force Battle to start in 3s.",
-    func=function(name,param)
-        if #battle.queue<1 then
-            msg(name,"No players in queue.")
-            return
-        end
-        battle.state="countdown"
-        battle.countdown=3
-        battle.vote_active=true
-        battle.votes={}
-        broadcast("Admin "..name.." forced Battle start (3s).")
-        for _,pname in ipairs(battle.queue) do
-            minetest.after(0.5,function() show_map_vote_formspec(pname) end)
-        end
-    end
-})
-
-minetest.register_chatcommand("battle_reset",{
-    privs={server=true},
-    description="Reset Battle system.",
-    func=function(name,param)
-        reset_match_state()
-        broadcast("Battle reset by "..name..".")
-    end
-})
-
-minetest.register_chatcommand("battle_set_lobby_spawn",{
-    privs={server=true},
-    description="Set lobby spawn to your position.",
-    func=function(name,param)
-        local p = minetest.get_player_by_name(name); if not p then return end
-        local pos = vector.round(p:get_pos())
-        config.lobby_spawn = pos
-        save_config()
-        msg(name,"Lobby spawn set to "..minetest.pos_to_string(pos))
-    end
-})
-
-minetest.register_chatcommand("battle_set_my_spawn",{
-    privs={server=true},
-    description="Set your personal default spawn.",
-    func=function(name,param)
-        local p = minetest.get_player_by_name(name); if not p then return end
-        local pos = vector.round(p:get_pos())
-        config.player_spawns[name] = pos
-        save_config()
-        msg(name,"Your spawn set to "..minetest.pos_to_string(pos))
-    end
-})
-
-minetest.register_chatcommand("battle_clear_my_spawn",{
-    privs={server=true},
-    description="Clear your personal spawn.",
-    func=function(name,param)
-        if config.player_spawns[name] then
-            config.player_spawns[name]=nil
-            save_config()
-            msg(name,"Personal spawn cleared.")
-        else
-            msg(name,"You don't have a personal spawn set.")
-        end
-    end
-})
-
-minetest.register_chatcommand("battle_set_spawn",{
-    privs={server=true},
-    params="<arena_id> <slot>",
-    description="Set Battle spawn slot 1-8 for arena at your position.",
-    func=function(name,param)
-        local aid,slot_s = param:match("^(%S+)%s+(%S+)$")
-        if not aid or not slot_s then
-            msg(name,"Usage: /battle_set_spawn <arena_id> <slot 1-8>")
-            return
-        end
-        local slot = tonumber(slot_s)
-        if not slot or slot<1 or slot>8 then
-            msg(name,"Slot must be 1..8")
-            return
-        end
-        local p = minetest.get_player_by_name(name); if not p then return end
-        local pos = vector.round(p:get_pos())
-        local arena = get_or_create_arena(aid)
-        arena.spawn_points[slot] = pos
-        save_config()
-        msg(name,"Set Battle spawn slot #"..slot.." for '"..aid.."' at "..minetest.pos_to_string(pos))
-    end
-})
-
-minetest.register_chatcommand("battle_set_spec",{
-    privs={server=true},
-    params="<arena_id>",
-    description="Set spectator spawn for arena.",
-    func=function(name,param)
-        local aid = param ~= "" and param or "cove"
-        local p = minetest.get_player_by_name(name); if not p then return end
-        local pos = vector.round(p:get_pos())
-        local arena = get_or_create_arena(aid)
-        arena.spectator_spawn = pos
-        save_config()
-        msg(name,"Spectator spawn for '"..aid.."' set to "..minetest.pos_to_string(pos))
-    end
-})
-
-minetest.register_chatcommand("battle_set_center",{
-    privs={server=true},
-    params="<arena_id>",
-    description="Set arena center (for border/Tumble) to your position.",
-    func=function(name,param)
-        local aid = param ~= "" and param or "cove"
-        local p = minetest.get_player_by_name(name); if not p then return end
-        local pos = vector.round(p:get_pos())
-        local arena = get_or_create_arena(aid)
-        arena.center = pos
-        save_config()
-        msg(name,"Center for '"..aid.."' set to "..minetest.pos_to_string(pos))
-    end
-})
-
-minetest.register_chatcommand("battle_set_radius",{
-    privs={server=true},
-    params="<arena_id> <radius>",
-    description="Set arena radius.",
-    func=function(name,param)
-        local aid,rs = param:match("^(%S+)%s+(%S+)$")
-        if not aid or not rs then
-            msg(name,"Usage: /battle_set_radius <arena_id> <radius>")
-            return
-        end
-        local r = tonumber(rs)
-        if not r or r<=0 then
-            msg(name,"Radius must be > 0")
-            return
-        end
-        local arena = get_or_create_arena(aid)
-        arena.radius = r
-        save_config()
-        msg(name,"Radius for '"..aid.."' set to "..r)
-    end
-})
-
-minetest.register_chatcommand("battle_mark_chest",{
-    privs={server=true},
-    params="<arena_id> <center|valuable|regular|special>",
-    description="Mark chest under you as Battle loot chest.",
-    func=function(name,param)
-        local aid,ctype = param:match("^(%S+)%s+(%S+)$")
-        if not aid or not ctype then
-            msg(name,"Usage: /battle_mark_chest <arena_id> <center|valuable|regular|special>")
-            return
-        end
-        ctype = ctype:lower()
-        if not (ctype=="center" or ctype=="valuable" or ctype=="regular" or ctype=="special") then
-            msg(name,"Type must be center/valuable/regular/special")
-            return
-        end
-        local p = minetest.get_player_by_name(name); if not p then return end
-        local pos = p:get_pos()
-        local cpos = vector.round({x=pos.x,y=pos.y-1,z=pos.z})
-        local node = minetest.get_node(cpos)
-        if not node or (node.name~="mcl_chests:chest" and node.name~="mcl_chests:trapped_chest") then
-            msg(name,"No Mineclonia chest directly under you.")
-            return
-        end
-        local arena = get_or_create_arena(aid)
-        arena.chests = arena.chests or {}
-        table.insert(arena.chests,{pos=cpos,ctype=ctype})
-        save_config()
-        msg(name,("Registered %s chest at %s for '%s'"):format(
-            ctype,minetest.pos_to_string(cpos),aid))
-    end
-})
-
-minetest.register_chatcommand("battle_set_enabled",{
-    privs={server=true},
-    params="<arena_id> <true|false>",
-    description="Enable/disable arena for selection.",
-    func=function(name,param)
-        local aid,flag = param:match("^(%S+)%s+(%S+)$")
-        if not aid or not flag then
-            msg(name,"Usage: /battle_set_enabled <arena_id> <true|false>")
-            return
-        end
-        local arena = get_or_create_arena(aid)
-        if flag=="true" then arena.enabled=true
-        elseif flag=="false" then arena.enabled=false
-        else msg(name,"Second arg must be true/false"); return end
-        save_config()
-        msg(name,"Arena '"..aid.."' enabled="..tostring(arena.enabled))
-    end
-})
-
-minetest.register_chatcommand("battle_legacy_atmosphere",{
-    privs={server=true},
-    params="<on|off>",
-    description="Toggle Legacy-style sky/lighting.",
-    func=function(name,param)
-        param = (param or ""):lower()
-        if param~="on" and param~="off" then
-            msg(name,"Usage: /battle_legacy_atmosphere <on|off>")
-            return
-        end
-        LEGACY_ATMOS_ENABLED = (param=="on")
-        for _,p in ipairs(minetest.get_connected_players()) do
-            if LEGACY_ATMOS_ENABLED then apply_legacy_atmosphere(p)
-            else clear_legacy_atmosphere(p) end
-        end
-        msg(name,"Legacy atmosphere: "..param)
-    end
-})
-
-------------------------------------------------------------
--- CHAT COMMANDS: MAP RESET SNAPSHOTS
-------------------------------------------------------------
-
-minetest.register_chatcommand("battle_pos1", {
-    privs = { server = true },
-    description = "Set pos1 for Battle arena snapshot region.",
+minetest.register_chatcommand("battle_queue", {
+    description = "Show current Battle queue status",
     func = function(name, param)
-        local player = minetest.get_player_by_name(name)
-        if not player then return end
-        local pos = vector.round(player:get_pos())
-        battle_pos_marks[name] = battle_pos_marks[name] or {}
-        battle_pos_marks[name].pos1 = pos
-        msg(name, "battle_pos1 set to " .. minetest.pos_to_string(pos))
-    end,
+        local queue_size = #battle.queue
+        local state_msg = battle.state == "running" and "Match in progress" 
+                        or battle.state == "countdown" and "Starting in "..math.floor(battle.countdown).."s"
+                        or "Waiting for players"
+        
+        msg(name, string.format("Battle: %s | Queue: %d/%d players", 
+            state_msg, queue_size, MIN_PLAYERS))
+        
+        if queue_size > 0 then
+            local players = table.concat(battle.queue, ", ")
+            msg(name, "Queued: " .. players)
+        end
+    end
 })
 
-minetest.register_chatcommand("battle_pos2", {
-    privs = { server = true },
-    description = "Set pos2 for Battle arena snapshot region.",
+minetest.register_chatcommand("battle_validate_arenas", {
+    privs = {server = true},
+    description = "Validate all arenas and show issues",
     func = function(name, param)
-        local player = minetest.get_player_by_name(name)
-        if not player then return end
-        local pos = vector.round(player:get_pos())
-        battle_pos_marks[name] = battle_pos_marks[name] or {}
-        battle_pos_marks[name].pos2 = pos
-        msg(name, "battle_pos2 set to " .. minetest.pos_to_string(pos))
-    end,
+        local has_issues = false
+        for aid, arena in pairs(config.arenas) do
+            local valid, errors = validate_arena(aid, arena)
+            if not valid then
+                msg(name, "Arena '" .. aid .. "': " .. table.concat(errors, ", "))
+                has_issues = true
+            end
+        end
+        if not has_issues then
+            msg(name, "All arenas are valid!")
+        end
+    end
 })
 
-minetest.register_chatcommand("battle_save_snapshot", {
-    privs = { server = true },
-    params = "<arena_id>",
-    description = "Save/reset snapshot for an arena using your battle_pos1/pos2.",
-    func = function(name, param)
-        local aid = param ~= "" and param or nil
-        if not aid then
-            msg(name, "Usage: /battle_save_snapshot <arena_id>")
-            return
-        end
+-- I HAVE MISSED OUT SOME THINGS DO NOT PULL
 
-        local marks = battle_pos_marks[name]
-        if not marks or not marks.pos1 or not marks.pos2 then
-            msg(name, "You must set /battle_pos1 and /battle_pos2 first.")
-            return
-        end
-
-        local p1 = marks.pos1
-        local p2 = marks.pos2
-        local minp = {
-            x = math.min(p1.x, p2.x),
-            y = math.min(p1.y, p2.y),
-            z = math.min(p1.z, p2.z),
-        }
-        local maxp = {
-            x = math.max(p1.x, p2.x),
-            y = math.max(p1.y, p2.y),
-            z = math.max(p1.z, p2.z),
-        }
-
-        local filename = worldpath .. "/battle_" .. aid .. "_reset.mts"
-
-        minetest.chat_send_player(name, "Saving schematic to: " .. filename)
-        local ok, err = pcall(minetest.create_schematic, minp, maxp, nil, filename)
-        if not ok then
-            msg(name, "Failed to create schematic: " .. tostring(err))
-            return
-        end
-
-        local arena = get_or_create_arena(aid)
-        arena.reset_schematic = "battle_" .. aid .. "_reset.mts"
-        arena.reset_origin = minp
-        save_config()
-
-        msg(name, "Snapshot for arena '" .. aid .. "' saved.")
-        msg(name, "It will be used to reset the map after each match.")
-    end,
-})
-
-minetest.register_chatcommand("battle_restore_now", {
-    privs = { server = true },
-    params = "<arena_id>",
-    description = "Immediately restore an arena from its snapshot.",
-    func = function(name, param)
-        local aid = param ~= "" and param or nil
-        if not aid then
-            msg(name, "Usage: /battle_restore_now <arena_id>")
-            return
-        end
-
-        local arena = config.arenas[aid]
-        if not arena or not arena.reset_schematic or not arena.reset_origin then
-            msg(name, "Arena '" .. aid .. "' has no snapshot saved.")
-            return
-        end
-
-        local filename = worldpath .. "/" .. arena.reset_schematic
-        minetest.chat_send_player(name, "Restoring from: " .. filename)
-
-        local ok, err = pcall(minetest.place_schematic,
-            arena.reset_origin, filename, "0", nil, true)
-        if not ok then
-            msg(name, "Failed to restore arena: " .. tostring(err))
-        else
-            msg(name, "Arena '" .. aid .. "' restored from snapshot.")
-        end
-
-        build_tumble_layers_for_arena(arena)
-    end,
-})
+-- [Admin commands]
 
 ------------------------------------------------------------
 -- CHAT COMMANDS: TUMBLE
@@ -1997,427 +1954,23 @@ minetest.register_chatcommand("tumble_undo_layers", {
         build_tumble_layers_for_arena(arena)
     end,
 })
-
 ------------------------------------------------------------
--- UNKNOWN NODE CLEANER
-------------------------------------------------------------
-
-local function battle_clean_unknown_in_arena(aid, replacement)
-    local arena = config.arenas[aid]
-    if not arena or not arena.center or not arena.radius then
-        return false, "Arena has no center/radius set."
-    end
-
-    local rep_def = minetest.registered_nodes[replacement]
-    if not rep_def then
-        return false, "Replacement node '"..replacement.."' is not registered."
-    end
-
-    local c_rep = minetest.get_content_id(replacement)
-
-    local r = arena.radius
-    local y_min = -64
-    local y_max = 64
-
-    local minp = {x = arena.center.x - r, y = y_min, z = arena.center.z - r}
-    local maxp = {x = arena.center.x + r, y = y_max, z = arena.center.z + r}
-
-    local vm = minetest.get_voxel_manip()
-    local emin, emax = vm:read_from_map(minp, maxp)
-    local data = vm:get_data()
-    local area = VoxelArea:new({MinEdge = emin, MaxEdge = emax})
-
-    local reg_nodes = minetest.registered_nodes
-    local changed = 0
-
-    for z = emin.z, emax.z do
-        for y = emin.y, emax.y do
-            for x = emin.x, emax.x do
-                local vi = area:index(x,y,z)
-                local cid = data[vi]
-                local name = minetest.get_name_from_content_id(cid)
-                if not reg_nodes[name] or name == "unknown:unknown" then
-                    data[vi] = c_rep
-                    changed = changed + 1
-                end
-            end
-        end
-    end
-
-    if changed > 0 then
-        vm:set_data(data)
-        vm:write_to_map(true)
-        vm:update_map()
-    end
-
-    return true, changed
-end
-
-minetest.register_chatcommand("battle_clean_unknown", {
-    privs = { server = true },
-    params = "<arena_id> <replacement_node>",
-    description = "Replace unknown nodes in arena radius with a replacement node.",
-    func = function(name, param)
-        local aid, rep = param:match("^(%S+)%s+(%S+)$")
-        if not aid or not rep then
-            msg(name, "Usage: /battle_clean_unknown <arena_id> <replacement_node>")
-            return
-        end
-
-        local ok, changed_or_err = battle_clean_unknown_in_arena(aid, rep)
-        if not ok then
-            msg(name, "Error: "..changed_or_err)
-            return
-        end
-
-        msg(name, ("Replaced %d unknown nodes in arena '%s' with '%s'.")
-            :format(changed_or_err, aid, rep))
-    end,
-})
-
-------------------------------------------------------------
--- SNOWBALL OVERRIDE: TUMBLE BLOCK BREAKING
-------------------------------------------------------------
-
--- Nodes that snowballs can break (Mineclonia IDs)
-local SNOWBALL_BREAKABLE = {
-    -- Glass / Ice
-    ["mcl_core:glass"] = true,
-    ["mcl_core:glass_black"] = true, -- obsidian-like black glass
-    ["mcl_core:packed_ice"] = true,
-    ["mcl_core:ice"] = true,
-
-    -- Dirt / Grass
-    ["mcl_core:dirt"] = true,
-    ["mcl_core:dirt_with_grass"] = true,
-    ["mcl_core:dirt_with_grass_dry"] = true,
-    ["mcl_core:dirt_with_rainforest_litter"] = true,
-    ["mcl_core:dirt_with_coniferous_litter"] = true,
-
-    -- Sand / Gravel / Clay
-    ["mcl_core:sand"] = true,
-    ["mcl_core:red_sand"] = true,
-    ["mcl_core:silver_sand"] = true, -- if present
-    ["mcl_core:gravel"] = true,
-    ["mcl_core:clay"] = true,
-
-    -- Snow
-    ["mcl_core:snow"] = true,
-    ["mcl_core:snowblock"] = true,
-}
-
--- Configuration
-local config = {
-    break_chance = 1.0,                 -- 100% chance to break blocks
-    break_radius = 0,                   -- 0 = just the hit node
-    enable_particles = true,
-    break_sound = "default_break_glass", -- change to a Mineclonia sound if you like
-}
-
---------------------------------------------------------------------
--- Helpers
---------------------------------------------------------------------
-
-local function break_node_at(pos)
-    local node = minetest.get_node(pos)
-    local def = minetest.registered_nodes[node.name]
-    if not def then
-        return false
-    end
-
-    if not SNOWBALL_BREAKABLE[node.name] then
-        return false
-    end
-
-    -- Chance to break
-    if math.random() > config.break_chance then
-        return false
-    end
-
-    minetest.remove_node(pos)
-
-    if config.break_sound then
-        minetest.sound_play(config.break_sound, {
-            pos = pos,
-            gain = 0.5,
-            max_hear_distance = 16,
-        })
-    end
-
-    if config.enable_particles then
-        minetest.add_particlespawner({
-            amount = 8,
-            time = 0.1,
-            minpos = {x = pos.x - 0.5, y = pos.y - 0.5, z = pos.z - 0.5},
-            maxpos = {x = pos.x + 0.5, y = pos.y + 0.5, z = pos.z + 0.5},
-            minvel = {x = -2, y = -2, z = -2},
-            maxvel = {x = 2, y = 2, z = 2},
-            minacc = {x = 0, y = -9.81, z = 0},
-            maxacc = {x = 0, y = -9.81, z = 0},
-            minexptime = 0.5,
-            maxexptime = 1.0,
-            minsize = 0.5,
-            maxsize = 1.0,
-            collisiondetection = true,
-            texture = "default_item_smoke.png", -- swap to a Mineclonia texture if you want
-        })
-    end
-
-    return true
-end
-
-local function break_nodes_around(pos)
-    local r = math.floor(config.break_radius or 0)
-    local broke_any = false
-
-    if r <= 0 then
-        return break_node_at(pos)
-    end
-
-    for dx = -r, r do
-        for dy = -r, r do
-            for dz = -r, r do
-                local p = { x = pos.x + dx, y = pos.y + dy, z = pos.z + dz }
-                if break_node_at(p) then
-                    broke_any = true
-                end
-            end
-        end
-    end
-
-    return broke_any
-end
-
---------------------------------------------------------------------
--- This is what battle_lobby calls in on_mods_loaded
---------------------------------------------------------------------
-
--- MUST be global so the callback can see it
-function patch_snowball_for_tumble()
-    -- Try Mineclonia's snowball entity name(s)
-    local snowball_def =
-        minetest.registered_entities["mcl_throwing:snowball"]
-        or minetest.registered_entities["mcl_throwing:snowball_entity"]
-
-    if not snowball_def then
-        minetest.log("error",
-            "[battle_lobby] Snowball entity not found; Tumble snowball patch skipped.")
-        return
-    end
-
-    -- Avoid double patching
-    if snowball_def._battle_lobby_snowball_patched then
-        return
-    end
-    snowball_def._battle_lobby_snowball_patched = true
-
-    local old_on_step = snowball_def.on_step
-
-    snowball_def.on_step = function(self, dtime, moveresult)
-        -- Call original behavior first to keep Mineclonia logic
-        if old_on_step then
-            -- Extra arg is harmless if the original only accepts (self, dtime)
-            old_on_step(self, dtime, moveresult)
-        end
-
-        -- If the snowball was removed by original logic, bail
-        if not self.object or not self.object:get_pos() then
-            return
-        end
-
-        -- Use moveresult collisions from Luanti 5.14
-        if not (moveresult and moveresult.collisions) then
-            return
-        end
-
-        for _, collision in ipairs(moveresult.collisions) do
-            if collision.type == "node" and collision.node_pos then
-                local hit_pos = collision.node_pos
-
-                -- Try breaking the node (or nodes in radius)
-                if break_nodes_around(hit_pos) then
-                    -- Remove snowball only if we actually broke something
-                    self.object:remove()
-                    return
-                end
-            end
-        end
-    end
-
-    minetest.log("action",
-        "[battle_lobby] Snowball entity patched for Tumble (block breaking enabled).")
-end
-
---------------------------------------------------------------------
--- Chat command to toggle behaviour
---------------------------------------------------------------------
-
-minetest.register_chatcommand("snowball_break", {
-    params = "<on|off|list>",
-    description = "Control snowball block breaking",
-    func = function(name, param)
-        if param == "on" then
-            config.break_chance = 1.0
-            return true, "Snowball block breaking enabled"
-        elseif param == "off" then
-            config.break_chance = 0.0
-            return true, "Snowball block breaking disabled"
-        elseif param == "list" then
-            local count = 0
-            for _ in pairs(SNOWBALL_BREAKABLE) do
-                count = count + 1
-            end
-            return true, "Snowballs can break " .. count .. " different block types"
-        else
-            return false, "Usage: /snowball_break <on|off|list>"
-        end
-    end
-})
-
-minetest.log("action",
-    "[battle_lobby] Snowball breaker logic loaded (waiting for patch_snowball_for_tumble()).")
-
-minetest.register_chatcommand("remove_unknown", {
-    params = "<radius>",
-    description = "Remove unknown nodes in a cube around you (admin only).",
-    privs = { server = true },
-    func = function(name, param)
-        local player = minetest.get_player_by_name(name)
-        if not player then
-            return false, "Player not found."
-        end
-
-        local r = tonumber(param)
-        if not r or r <= 0 then
-            return false, "Usage: /remove_unknown <radius> (positive number)"
-        end
-
-        -- Clamp radius a bit so you don't accidentally nuke half the map
-        if r > 50 then
-            r = 50
-            minetest.chat_send_player(name, "Radius clamped to 50 to avoid lag.")
-        end
-
-        local pos = vector.round(player:get_pos())
-        local minp = vector.subtract(pos, r)
-        local maxp = vector.add(pos, r)
-
-        local t0 = minetest.get_us_time()
-
-        local vm = minetest.get_voxel_manip()
-        local emin, emax = vm:read_from_map(minp, maxp)
-        local area = VoxelArea:new{ MinEdge = emin, MaxEdge = emax }
-        local data = vm:get_data()
-
-        local c_air = minetest.get_content_id("air")
-
-        local removed = 0
-        local seen_ids = {}
-
-        for vi in area:iter(emin.x, emin.y, emin.z, emax.x, emax.y, emax.z) do
-            local cid = data[vi]
-
-            -- Cache lookups by content ID
-            local info = seen_ids[cid]
-            if info == nil then
-                local nname = minetest.get_name_from_content_id(cid)
-                -- unknown if no name OR not registered as a node
-                if not nname or not minetest.registered_nodes[nname] then
-                    info = "unknown"
-                else
-                    info = "ok"
-                end
-                seen_ids[cid] = info
-            end
-
-            if info == "unknown" then
-                data[vi] = c_air
-                removed = removed + 1
-            end
-        end
-
-        vm:set_data(data)
-        vm:write_to_map()
-        vm:update_map()
-
-        local dt = (minetest.get_us_time() - t0) / 1e6
-        minetest.chat_send_player(name,
-            ("Removed %d unknown nodes in radius %d (%.2f s)")
-            :format(removed, r, dt))
-
-        return true
-    end,
-})
-
-minetest.register_chatcommand("tumble_remove_layer", {
-    privs = { server = true },
-    params = "<arena_id> <index>",
-    description = "Remove a single Tumble layer by index (1 = first layer).",
-    func = function(name, param)
-        local aid, idx_s = param:match("^(%S+)%s+(%S+)$")
-        if not aid or not idx_s then
-            msg(name, "Usage: /tumble_remove_layer <arena_id> <index>")
-            return
-        end
-
-        local idx = tonumber(idx_s)
-        if not idx or idx < 1 then
-            msg(name, "Index must be a positive number (1 = first layer).")
-            return
-        end
-
-        local arena = config.arenas[aid]
-        if not arena or not arena.tumble_layers then
-            msg(name, "Arena '" .. aid .. "' has no Tumble layers.")
-            return
-        end
-
-        if idx > #arena.tumble_layers then
-            msg(name, ("Arena '%s' only has %d layer(s)."):format(aid, #arena.tumble_layers))
-            return
-        end
-
-        backup_tumble_layers(aid, arena) -- use the existing backup
-
-        local removed = table.remove(arena.tumble_layers, idx)
-        save_config()
-
-        msg(name, ("Removed layer #%d from '%s' (y=%s, radius=%s).")
-            :format(idx, aid, tostring(removed.y), tostring(removed.radius)))
-
-        build_tumble_layers_for_arena(arena)
-    end,
-})
-
-------------------------------------------------------------
--- MODS LOADED PATCHES: CHESTS + SNOWBALL
+-- MODS LOADED PATCHES: CHESTS + SNOWBALL + ALIASES
 ------------------------------------------------------------
 
 minetest.register_on_mods_loaded(function()
     override_chest_for_battle("mcl_chests:chest")
     override_chest_for_battle("mcl_chests:trapped_chest")
     patch_snowball_for_tumble()
+    register_node_aliases()
+    
+    minetest.log("action", "[battle_lobby] All mod patches and aliases applied")
 end)
 
-minetest.register_alias("default:pine_wood", "mcl_trees:wood_spruce")
--- Stairs
-minetest.register_alias("stairs:stair_pine_wood", "mcl_stairs:stair_spruce")
-minetest.register_alias("stairs:stair_pine_tree", "mcl_stairs:stair_log_spruce") -- if present
-
--- Slabs
-minetest.register_alias("stairs:slab_pine_wood", "mcl_stairs:slab_spruce")
-minetest.register_alias("stairs:slab_pine_tree", "mcl_stairs:slab_spruce_bark") -- if present
---minetest.register_alias("default:mese", "mcl_redstone_torch:redstoneblock") -- if present
-minetest.register_alias("walls:cobble", "mcl_walls:cobble") -- if present
-
--- Convert Minetest Game lava to Mineclonia lava
-minetest.register_alias("default:lava_source", "mcl_core:lava_source")
-minetest.register_alias("default:lava_flowing", "mcl_core:lava_flowing")
-
-minetest.register_alias("nether:brick", "mcl_nether:nether_brick")
-minetest.register_alias("default:fence_wood", "mcl_fences:oak_fence")
-minetest.register_alias("default:fence_pine_wood", "mcl_fences:spruce_fence")
-minetest.register_alias("default:fence_rail_pine_wood", "mcl_fences:spruce_fence_gate")
-
-minetest.register_alias("xdecor:stone_rune", "mcl_core:stonebrickcarved")
-minetest.register_alias("xdecor:stone_tile", "mcl_core:stone_smooth")
+-- Initialize any players who might be online when the mod loads
+minetest.register_on_joinplayer(function(player)
+    local name = player:get_player_name()
+    if name then
+        init_player_stats(name)
+    end
+end)
